@@ -1,5 +1,9 @@
+#include <unistd.h>
 #include <sys/time.h>
 #include <dirent.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
 #include "network.h"
 #include "region_layer.h"
 #include "cost_layer.h"
@@ -444,7 +448,7 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
     char *name_list = option_find_str(options, "names", "data/names.list");
     char **names = get_labels(name_list);
 
-    image **alphabet = load_alphabet();
+	image **alphabet = load_alphabet();
     network net = parse_network_cfg(cfgfile);
     if(weightfile){
         load_weights(&net, weightfile);
@@ -486,7 +490,7 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
 		printf("%s: Predicted in %ld ms.\n", input, (stop.tv_sec * 1000 + stop.tv_usec / 1000) - (start.tv_sec * 1000 + start.tv_usec / 1000));
         get_region_boxes(l, 1, 1, thresh, probs, boxes, 0, 0);
 		if (nms) do_nms_sort(boxes, probs, l.w*l.h*l.n, l.classes, nms);
-        draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
+		draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
         save_image(im, "predictions");
         show_image(im, "predictions");
 
@@ -570,6 +574,170 @@ void play_detector(char *datacfg, char *cfgfile, char *weightfile, char *path, f
 	free_ptrs((void **)probs, l.w*l.h*l.n);
 }
 
+#define PORT	5555
+
+int create_server()
+{
+	struct sockaddr_in server_addr;
+	int server_sock;
+
+	server_sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (server_sock < 0) {
+		printf("socket() failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	server_addr.sin_port = htons(PORT);
+
+	if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+		printf("bind() failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (listen(server_sock, 1) < 0) {
+		printf("listen() failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	return server_sock;
+}
+
+#define MAX_SNAPSHOT	8
+
+void detection_info(image im, int num, float thresh, box *boxes, float **probs, char **names, int classes, int index, FILE* fp)
+{
+	const char *object_format = "{\"class\":\"%s\",\"left\":%d,\"right\":%d,\"top\":%d,\"bottom\":%d}";
+	char objects[4096] = {0,};
+	int offset = 0;
+	fprintf(fp, "{\"objects\":[");
+
+	int i;
+	for(i = 0; i < num; ++i){
+		int class = max_index(probs[i], classes);
+		float prob = probs[i][class];
+		if(prob > thresh){
+			box b = boxes[i];
+
+			int left  = (b.x-b.w/2.)*im.w;
+			int right = (b.x+b.w/2.)*im.w;
+			int top   = (b.y-b.h/2.)*im.h;
+			int bot   = (b.y+b.h/2.)*im.h;
+
+			if(left < 0) left = 0;
+			if(right > im.w-1) right = im.w-1;
+			if(top < 0) top = 0;
+			if(bot > im.h-1) bot = im.h-1;
+
+			printf("%s: %.0f%% %d %d %d %d\n", names[class], prob*100, left, right, top, bot);
+			offset += sprintf(&objects[offset], object_format, names[class], left, right, top, bot);
+			offset += sprintf(&objects[offset], ",");
+		}
+	}
+
+	objects[strlen(objects) - 1] = 0;
+	fprintf(fp, objects);
+	fprintf(fp, "]}");
+	if (index + 1 < MAX_SNAPSHOT) fprintf(fp, ",");
+}
+
+void server_detector(char *datacfg, char *cfgfile, char *weightfile, float thresh)
+{
+	list *options = read_data_cfg(datacfg);
+	char *name_list = option_find_str(options, "names", "data/names.list");
+	char **names = get_labels(name_list);
+
+	image **alphabet = load_alphabet();
+	network net = parse_network_cfg(cfgfile);
+	if(weightfile){
+		load_weights(&net, weightfile);
+	}
+	set_batch_network(&net, 1);
+	srand(2222222);
+	struct timeval start, stop;
+	char buff[256];
+	char *input = buff;
+	char path[256];
+	int j;
+	float nms=.4;
+
+	layer l = net.layers[net.n-1];
+	box *boxes = calloc(l.w*l.h*l.n, sizeof(box));
+	float **probs = calloc(l.w*l.h*l.n, sizeof(float *));
+	for(j = 0; j < l.w*l.h*l.n; ++j) probs[j] = calloc(l.classes, sizeof(float *));
+#ifdef NNPACK
+	nnp_initialize();
+	net.threadpool = pthreadpool_create(4);
+#endif
+
+	struct sockaddr_in client_addr;
+	int server_sock, client_sock;
+	size_t len = sizeof(client_addr);
+	server_sock = create_server();
+	if (server_sock < 0) return;
+
+	while (1) {
+		client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &len);
+		if (client_sock < 0) {
+			printf("accept() failed: %s\n", strerror(errno));
+			break;
+		}
+
+		int size = 0;
+		memset(path, 0, sizeof(path));
+		read(client_sock, &size, sizeof(size));
+		read(client_sock, path, size);
+		close(client_sock);
+
+		char meta_filename[128];
+		snprintf(meta_filename, sizeof(meta_filename), "%s/metadata.txt", path);
+
+		FILE *meta_file = fopen(meta_filename, "w");
+		if (!meta_file) {
+			printf("fopen() failed: %s\n", strerror(errno));
+			break;
+		}
+		fprintf(meta_file, "{\"snapshot\":[");
+
+		int i;
+		for (i = 0; i < MAX_SNAPSHOT; i++) {
+			sprintf(input, "%s/%d.jpg", path, i);
+			image im = load_image_color(input,0,0);
+			image sized = resize_image(im, net.w, net.h);
+
+			float *X = sized.data;
+			gettimeofday(&start, 0);
+			network_predict(net, X);
+			gettimeofday(&stop, 0);
+			printf("%s: Predicted in %ld ms.\n", input, (stop.tv_sec * 1000 + stop.tv_usec / 1000) - (start.tv_sec * 1000 + start.tv_usec / 1000));
+			get_region_boxes(l, 1, 1, thresh, probs, boxes, 0, 0);
+			if (nms) do_nms_sort(boxes, probs, l.w*l.h*l.n, l.classes, nms);
+			detection_info(im, l.w*l.h*l.n, thresh, boxes, probs, names, l.classes, i, meta_file);
+
+			/*draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
+			char filename[128];
+			snprintf(filename, sizeof(filename), "predictions%02d", i);
+			save_image(im, filename);*/
+
+			free_image(im);
+			free_image(sized);
+		}
+
+		fprintf(meta_file, "]}");
+		fclose(meta_file);
+	}
+
+	close(server_sock);
+#ifdef NNPACK
+	pthreadpool_destroy(net.threadpool);
+	nnp_deinitialize();
+#endif
+	free(boxes);
+	free_ptrs((void **)probs, l.w*l.h*l.n);
+}
+
 void run_detector(int argc, char **argv)
 {
     char *prefix = find_char_arg(argc, argv, "-prefix", 0);
@@ -611,6 +779,7 @@ void run_detector(int argc, char **argv)
     char *filename = (argc > 6) ? argv[6]: 0;
     if(0==strcmp(argv[2], "test")) test_detector(datacfg, cfg, weights, filename, thresh);
 	else if(0==strcmp(argv[2], "play")) play_detector(datacfg, cfg, weights, filename, thresh);
+	else if(0==strcmp(argv[2], "server")) server_detector(datacfg, cfg, weights, thresh);
     else if(0==strcmp(argv[2], "train")) train_detector(datacfg, cfg, weights, gpus, ngpus, clear);
     else if(0==strcmp(argv[2], "valid")) validate_detector(datacfg, cfg, weights);
     else if(0==strcmp(argv[2], "recall")) validate_detector_recall(cfg, weights);

@@ -593,7 +593,7 @@ network parse_network_cfg(char *filename)
     section *s = (section *)n->val;
     list *options = s->options;
     if(!is_network(s)) error("First section must be [net] or [network]");
-    parse_net_options(options, &net);
+	parse_net_options(options, &net);
 
     params.h = net.h;
     params.w = net.w;
@@ -607,14 +607,14 @@ network parse_network_cfg(char *filename)
     n = n->next;
     int count = 0;
     free_section(s);
-    fprintf(stderr, "layer     filters    size              input                output\n");
-    while(n){
-        params.index = count;
+	fprintf(stderr, "layer     filters    size              input                output\n");
+	while(n){
+		params.index = count;
         fprintf(stderr, "%5d ", count);
         s = (section *)n->val;
         options = s->options;
         layer l = {0};
-        LAYER_TYPE lt = string_to_layer_type(s->type);
+		LAYER_TYPE lt = string_to_layer_type(s->type);
         if(lt == CONVOLUTIONAL){
             l = parse_convolutional(options, params);
         }else if(lt == LOCAL){
@@ -635,9 +635,9 @@ network parse_network_cfg(char *filename)
             l = parse_cost(options, params);
         }else if(lt == REGION){
             l = parse_region(options, params);
-        }else if(lt == DETECTION){
-            l = parse_detection(options, params);
-        }else if(lt == SOFTMAX){
+		}else if(lt == DETECTION){
+			l = parse_detection(options, params);
+		}else if(lt == SOFTMAX){
             l = parse_softmax(options, params);
             net.hierarchy = l.softmax_tree;
         }else if(lt == NORMALIZATION){
@@ -678,12 +678,12 @@ network parse_network_cfg(char *filename)
             params.w = l.out_w;
             params.c = l.out_c;
             params.inputs = l.outputs;
-        }
-    }   
+		}
+	}
     free_list(sections);
     net.outputs = get_network_output_size(net);
-    net.output = get_network_output(net);
-    if(workspace_size){
+	net.output = get_network_output(net);
+	if(workspace_size){
         //printf("%ld\n", workspace_size);
 #ifdef GPU
         if(gpu_index >= 0){
@@ -692,9 +692,9 @@ network parse_network_cfg(char *filename)
             net.workspace = calloc(1, workspace_size);
         }
 #else
-        net.workspace = calloc(1, workspace_size);
+		net.workspace = calloc(1, workspace_size);
 #endif
-    }
+	}
     return net;
 }
 
