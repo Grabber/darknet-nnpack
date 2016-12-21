@@ -692,7 +692,7 @@ void server_detector(char *datacfg, char *cfgfile, char *weightfile, float thres
 		close(client_sock);
 
 		char meta_filename[128];
-		snprintf(meta_filename, sizeof(meta_filename), "%s/metadata.txt", path);
+		snprintf(meta_filename, sizeof(meta_filename), "%s/metadata.json", path);
 
 		FILE *meta_file = fopen(meta_filename, "w");
 		if (!meta_file) {
